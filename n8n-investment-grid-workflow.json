@@ -1,0 +1,258 @@
+{
+  "name": "📊 投資十二宮格 — 每日數據管線",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 7 * * 1-5"
+            }
+          ]
+        }
+      },
+      "id": "schedule-trigger",
+      "name": "⏰ 每日排程 (週一至五 07:00)",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [0, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ═══════════════════════════════════════\n// 觀察清單設定\n// ═══════════════════════════════════════\nconst WATCHLIST = [\n  { symbol: 'OKLO', name: 'Oklo Inc.', sector: 'Nuclear Energy' },\n  { symbol: 'CRWD', name: 'CrowdStrike', sector: 'Cybersecurity' },\n  { symbol: 'NVDA', name: 'NVIDIA', sector: 'Semiconductors' },\n  { symbol: 'AAPL', name: 'Apple Inc.', sector: 'Consumer Tech' },\n];\n\n// 輸出每檔股票作為獨立 item\nreturn WATCHLIST.map(stock => ({ json: stock }));"
+      },
+      "id": "watchlist",
+      "name": "📋 觀察清單",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [220, 300]
+    },
+    {
+      "parameters": {
+        "url": "=https://query1.finance.yahoo.com/v8/finance/chart/{{ $json.symbol }}?range=3mo&interval=1d&includePrePost=false",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true
+            }
+          }
+        },
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "User-Agent",
+              "value": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            }
+          ]
+        }
+      },
+      "id": "fetch-price-history",
+      "name": "📈 抓取歷史價格 (Yahoo Finance)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [460, 200],
+      "retryOnFail": true,
+      "waitBetweenTries": 3000,
+      "maxTries": 3
+    },
+    {
+      "parameters": {
+        "url": "=https://query1.finance.yahoo.com/v10/finance/quoteSummary/{{ $json.symbol }}?modules=defaultKeyStatistics,financialData,earningsHistory,institutionOwnership,insiderHolders,recommendationTrend",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true
+            }
+          }
+        },
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "User-Agent",
+              "value": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            }
+          ]
+        }
+      },
+      "id": "fetch-fundamentals",
+      "name": "🏦 抓取基本面數據",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [460, 400],
+      "retryOnFail": true,
+      "waitBetweenTries": 3000,
+      "maxTries": 3
+    },
+    {
+      "parameters": {
+        "url": "=https://news.google.com/rss/search?q={{ $json.symbol }}+stock&hl=en-US&gl=US&ceid=US:en",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true
+            }
+          }
+        }
+      },
+      "id": "fetch-news",
+      "name": "📰 抓取新聞 (Google News RSS)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [460, 600],
+      "retryOnFail": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// ═══════════════════════════════════════\n// 技術指標計算引擎\n// RSI(14) + 布林通道(20,2) + MA交叉\n// ═══════════════════════════════════════\n\nconst item = $input.first().json;\nlet chartData;\n\ntry {\n  const body = typeof item.body === 'string' ? JSON.parse(item.body) : item.body;\n  chartData = body.chart?.result?.[0];\n} catch(e) {\n  return [{ json: { error: 'Failed to parse chart data', symbol: item.symbol || 'unknown' } }];\n}\n\nif (!chartData) {\n  return [{ json: { error: 'No chart data', symbol: item.symbol || 'unknown' } }];\n}\n\nconst closes = chartData.indicators?.quote?.[0]?.close?.filter(c => c !== null) || [];\nconst highs = chartData.indicators?.quote?.[0]?.high?.filter(h => h !== null) || [];\nconst lows = chartData.indicators?.quote?.[0]?.low?.filter(l => l !== null) || [];\nconst volumes = chartData.indicators?.quote?.[0]?.volume?.filter(v => v !== null) || [];\nconst timestamps = chartData.timestamp || [];\n\nconst symbol = chartData.meta?.symbol || 'unknown';\nconst currentPrice = closes[closes.length - 1] || 0;\nconst prevClose = closes[closes.length - 2] || currentPrice;\n\n// --- RSI(14) ---\nfunction calcRSI(prices, period = 14) {\n  if (prices.length < period + 1) return null;\n  let gains = 0, losses = 0;\n  for (let i = prices.length - period; i < prices.length; i++) {\n    const diff = prices[i] - prices[i - 1];\n    if (diff > 0) gains += diff;\n    else losses += Math.abs(diff);\n  }\n  const avgGain = gains / period;\n  const avgLoss = losses / period;\n  if (avgLoss === 0) return 100;\n  const rs = avgGain / avgLoss;\n  return +(100 - 100 / (1 + rs)).toFixed(2);\n}\n\n// --- 布林通道(20,2) ---\nfunction calcBollinger(prices, period = 20, mult = 2) {\n  if (prices.length < period) return null;\n  const slice = prices.slice(-period);\n  const mean = slice.reduce((a, b) => a + b, 0) / period;\n  const variance = slice.reduce((a, b) => a + (b - mean) ** 2, 0) / period;\n  const std = Math.sqrt(variance);\n  return {\n    upper: +(mean + mult * std).toFixed(2),\n    middle: +mean.toFixed(2),\n    lower: +(mean - mult * std).toFixed(2),\n  };\n}\n\n// --- 均線 ---\nfunction calcMA(prices, period) {\n  if (prices.length < period) return null;\n  const slice = prices.slice(-period);\n  return +(slice.reduce((a, b) => a + b, 0) / period).toFixed(2);\n}\n\n// --- MACD(12,26,9) ---\nfunction calcEMA(prices, period) {\n  if (prices.length < period) return null;\n  const k = 2 / (period + 1);\n  let ema = prices.slice(0, period).reduce((a, b) => a + b, 0) / period;\n  for (let i = period; i < prices.length; i++) {\n    ema = prices[i] * k + ema * (1 - k);\n  }\n  return +ema.toFixed(2);\n}\n\nconst rsi = calcRSI(closes, 14);\nconst bollinger = calcBollinger(closes, 20, 2);\nconst ma5 = calcMA(closes, 5);\nconst ma10 = calcMA(closes, 10);\nconst ma20 = calcMA(closes, 20);\nconst ma50 = calcMA(closes, 50);\nconst ma60 = calcMA(closes, 60);\nconst ema12 = calcEMA(closes, 12);\nconst ema26 = calcEMA(closes, 26);\nconst macd = ema12 && ema26 ? +(ema12 - ema26).toFixed(2) : null;\n\n// --- 成交量分析 ---\nconst avgVolume20 = volumes.length >= 20\n  ? Math.round(volumes.slice(-20).reduce((a, b) => a + b, 0) / 20)\n  : null;\nconst latestVolume = volumes[volumes.length - 1] || 0;\nconst volumeRatio = avgVolume20 ? +(latestVolume / avgVolume20).toFixed(2) : null;\n\n// --- 買點三條件判斷 ---\nconst buySignals = {\n  rsiBelow20: rsi !== null && rsi < 20,\n  belowBollingerLower: bollinger !== null && currentPrice <= bollinger.lower,\n  belowMA50: ma50 !== null && currentPrice < ma50,\n  rsiBelow30: rsi !== null && rsi < 30,\n  aboveMA60: ma60 !== null && currentPrice > ma60,\n};\n\nconst buyScore = [buySignals.rsiBelow20, buySignals.belowBollingerLower, buySignals.belowMA50].filter(Boolean).length;\n\nreturn [{\n  json: {\n    symbol,\n    currentPrice: +currentPrice.toFixed(2),\n    prevClose: +prevClose.toFixed(2),\n    changePercent: +(((currentPrice - prevClose) / prevClose) * 100).toFixed(2),\n    technical: {\n      rsi,\n      bollinger,\n      ma5, ma10, ma20, ma50, ma60,\n      ema12, ema26, macd,\n      volumeRatio,\n      avgVolume20,\n      latestVolume,\n    },\n    buySignals,\n    buyScore,\n    dataPoints: closes.length,\n    lastUpdate: new Date().toISOString(),\n  }\n}];"
+      },
+      "id": "calc-technical",
+      "name": "📉 技術指標計算 (RSI + 布林 + MA)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [720, 200]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ═══════════════════════════════════════\n// 基本面數據解析\n// 5:3:2 體質分析引擎\n// ═══════════════════════════════════════\n\nconst item = $input.first().json;\nlet data;\n\ntry {\n  const body = typeof item.body === 'string' ? JSON.parse(item.body) : item.body;\n  data = body.quoteSummary?.result?.[0];\n} catch(e) {\n  return [{ json: { error: 'Failed to parse fundamentals', raw: item } }];\n}\n\nif (!data) {\n  return [{ json: { error: 'No fundamental data available' } }];\n}\n\nconst fd = data.financialData || {};\nconst ks = data.defaultKeyStatistics || {};\nconst rec = data.recommendationTrend?.trend?.[0] || {};\nconst inst = data.institutionOwnership?.ownershipList || [];\n\n// 提取關鍵指標\nconst fundamentals = {\n  // 價值面\n  pe: ks.trailingPE?.raw || null,\n  forwardPE: ks.forwardPE?.raw || null,\n  eps: ks.trailingEps?.raw || null,\n  bookValue: ks.bookValue?.raw || null,\n  priceToBook: ks.priceToBook?.raw || null,\n  roe: fd.returnOnEquity?.raw ? +(fd.returnOnEquity.raw * 100).toFixed(2) : null,\n  \n  // 成長面\n  revenueGrowth: fd.revenueGrowth?.raw ? +(fd.revenueGrowth.raw * 100).toFixed(2) : null,\n  earningsGrowth: fd.earningsGrowth?.raw ? +(fd.earningsGrowth.raw * 100).toFixed(2) : null,\n  \n  // 獲利面\n  grossMargins: fd.grossMargins?.raw ? +(fd.grossMargins.raw * 100).toFixed(2) : null,\n  operatingMargins: fd.operatingMargins?.raw ? +(fd.operatingMargins.raw * 100).toFixed(2) : null,\n  profitMargins: fd.profitMargins?.raw ? +(fd.profitMargins.raw * 100).toFixed(2) : null,\n  \n  // 現金流\n  freeCashflow: fd.freeCashflow?.raw || null,\n  operatingCashflow: fd.operatingCashflow?.raw || null,\n  totalRevenue: fd.totalRevenue?.raw || null,\n  \n  // 目標價\n  targetMeanPrice: fd.targetMeanPrice?.raw || null,\n  targetHighPrice: fd.targetHighPrice?.raw || null,\n  targetLowPrice: fd.targetLowPrice?.raw || null,\n  currentPrice: fd.currentPrice?.raw || null,\n  recommendationKey: fd.recommendationKey || null,\n  \n  // 分析師推薦\n  analystBuy: (rec.strongBuy || 0) + (rec.buy || 0),\n  analystHold: rec.hold || 0,\n  analystSell: (rec.sell || 0) + (rec.strongSell || 0),\n};\n\n// 40% 法則\nconst rule40 = (fundamentals.revenueGrowth || 0) + (fundamentals.operatingMargins || 0);\n\n// 5:3:2 體質計算\nlet valueScore = 0, growthScore = 0, specScore = 0;\n\n// 價值評分\nif (fundamentals.eps > 0) valueScore += 25;\nif (fundamentals.pe && fundamentals.pe < 30) valueScore += 20;\nelse if (fundamentals.pe && fundamentals.pe < 60) valueScore += 10;\nif (fundamentals.roe && fundamentals.roe > 15) valueScore += 20;\nif (fundamentals.grossMargins && fundamentals.grossMargins > 40) valueScore += 15;\nif (fundamentals.operatingMargins && fundamentals.operatingMargins > 20) valueScore += 20;\n\n// 成長評分\nif (fundamentals.revenueGrowth > 40) growthScore += 40;\nelse if (fundamentals.revenueGrowth > 20) growthScore += 25;\nelse if (fundamentals.revenueGrowth > 10) growthScore += 15;\nif (rule40 > 40) growthScore += 30;\nelse if (rule40 > 25) growthScore += 15;\n\n// 投機評分\nif (!fundamentals.eps || fundamentals.eps < 0) specScore += 30;\nif (fundamentals.pe && fundamentals.pe > 80) specScore += 20;\nif (!fundamentals.revenueGrowth || fundamentals.revenueGrowth <= 0) specScore += 15;\nif (!fundamentals.roe || fundamentals.roe < 0) specScore += 15;\n\nconst total = Math.max(valueScore + growthScore + specScore, 1);\nconst composition = {\n  value: Math.round(valueScore / total * 100),\n  growth: Math.round(growthScore / total * 100),\n  speculative: Math.round(specScore / total * 100),\n};\nconst sum = composition.value + composition.growth + composition.speculative;\nif (sum !== 100) composition.value += (100 - sum);\n\nconst dominant = Object.entries(composition).sort((a, b) => b[1] - a[1])[0][0];\n\n// 籌碼面 - 機構持股\nconst topInstitutions = inst.slice(0, 5).map(i => ({\n  name: i.organization || 'Unknown',\n  shares: i.position?.raw || 0,\n  changePercent: i.pctChange?.raw ? +(i.pctChange.raw * 100).toFixed(2) : 0,\n}));\n\nreturn [{\n  json: {\n    fundamentals,\n    rule40: +rule40.toFixed(2),\n    composition,\n    dominant,\n    topInstitutions,\n    lastUpdate: new Date().toISOString(),\n  }\n}];"
+      },
+      "id": "parse-fundamentals",
+      "name": "🏦 基本面解析 + 5:3:2 體質",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [720, 400]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ═══════════════════════════════════════\n// 新聞提取 (從 RSS XML 解析)\n// ═══════════════════════════════════════\n\nconst item = $input.first().json;\nconst body = item.body || item.data || '';\n\n// 簡單 XML 解析提取標題\nconst titleRegex = /<title><!\\[CDATA\\[(.+?)\\]\\]><\\/title>|<title>(.+?)<\\/title>/g;\nconst titles = [];\nlet match;\nlet count = 0;\n\nwhile ((match = titleRegex.exec(body)) !== null && count < 10) {\n  const title = match[1] || match[2] || '';\n  if (title && !title.includes('Google News') && title.length > 10) {\n    titles.push(title.trim());\n    count++;\n  }\n}\n\nreturn [{\n  json: {\n    headlines: titles,\n    headlineCount: titles.length,\n    rawForSentiment: titles.join(' | '),\n  }\n}];"
+      },
+      "id": "parse-news",
+      "name": "📰 新聞標題提取",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [720, 600]
+    },
+    {
+      "parameters": {
+        "url": "https://api.anthropic.com/v1/messages",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"model\": \"claude-sonnet-4-20250514\",\n  \"max_tokens\": 500,\n  \"messages\": [\n    {\n      \"role\": \"user\",\n      \"content\": \"你是投資新聞情緒分析師。分析以下新聞標題，回傳 JSON 格式（不要 markdown）：\\n{\\\"sentiment\\\": \\\"positive/neutral/negative\\\", \\\"score\\\": 0-100, \\\"themes\\\": [\\\"主題1\\\", \\\"主題2\\\"], \\\"summary\\\": \\\"一句話摘要\\\"}\\n\\n新聞標題：\\n{{ $json.rawForSentiment }}\"\n    }\n  ]\n}",
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "x-api-key",
+              "value": "={{ $env.ANTHROPIC_API_KEY }}"
+            },
+            {
+              "name": "anthropic-version",
+              "value": "2023-06-01"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "sentiment-analysis",
+      "name": "🧠 Claude 情緒分析",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [960, 600]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ═══════════════════════════════════════\n// 十二宮格坐標定位引擎\n// 整合：技術面 + 基本面 + 消息面\n// ═══════════════════════════════════════\n\nconst items = $input.all();\n\n// 收集所有維度的數據\nlet technical = {}, fundamentalData = {}, sentiment = {};\n\nfor (const item of items) {\n  const d = item.json;\n  if (d.technical) technical = d;\n  if (d.fundamentals) fundamentalData = d;\n  if (d.sentiment || d.headlines) {\n    // 解析 Claude 回傳的情緒\n    try {\n      if (d.content && d.content[0]) {\n        const text = d.content[0].text || '';\n        const clean = text.replace(/```json|```/g, '').trim();\n        sentiment = JSON.parse(clean);\n      } else if (d.headlines) {\n        sentiment = { sentiment: 'neutral', score: 50, themes: [], summary: 'No analysis' };\n      }\n    } catch(e) {\n      sentiment = { sentiment: 'neutral', score: 50, themes: [], summary: 'Parse failed' };\n    }\n  }\n}\n\nconst symbol = technical.symbol || 'UNKNOWN';\nconst price = technical.currentPrice || 0;\nconst rsi = technical.technical?.rsi;\nconst bollinger = technical.technical?.bollinger;\nconst composition = fundamentalData.composition || { value: 33, growth: 33, speculative: 34 };\nconst dominant = fundamentalData.dominant || 'growth';\nconst rule40 = fundamentalData.rule40 || 0;\nconst targetPrice = fundamentalData.fundamentals?.targetMeanPrice || price;\n\n// ═══ 坐標判定邏輯 ═══\nlet phase = 'evaluate';\n\n// 買進條件 (學長的三條件)\nconst buyConditions = [\n  price <= targetPrice,                                    // 股價 ≤ 目標價\n  rsi !== null && rsi < 20,                               // RSI < 20\n  bollinger && price <= bollinger.lower,                   // 觸及布林下軌\n];\nconst buyScore = buyConditions.filter(Boolean).length;\n\n// 賣出條件\nconst sellConditions = [\n  rsi !== null && rsi > 70,                               // RSI > 70 超買\n  bollinger && price >= bollinger.upper,                   // 觸及布林上軌\n  sentiment.sentiment === 'negative' && sentiment.score > 70, // 強烈負面新聞\n];\nconst sellScore = sellConditions.filter(Boolean).length;\n\n// 坐標判定\nif (buyScore >= 2) phase = 'buy';\nelse if (sellScore >= 2) phase = 'sell';\nelse if (rsi && rsi > 30 && rsi < 70 && technical.changePercent > -2) phase = 'hold';\nelse phase = 'evaluate';\n\n// ═══ 買入安全等級 ═══\nlet buyAlert = 'none';\nif (buyScore === 3) buyAlert = 'strong_buy';\nelse if (buyScore === 2) buyAlert = 'watch';\n\n// ═══ AI 投資建議生成 ═══\nconst insights = [];\n\ninsights.push(`📍 ${symbol} 坐標：${phase === 'evaluate' ? '評估' : phase === 'buy' ? '買進' : phase === 'hold' ? '持有' : '賣出'}-${dominant === 'value' ? '價值' : dominant === 'growth' ? '成長' : '投機'}`);\ninsights.push(`📐 體質：價值${composition.value}% 成長${composition.growth}% 投機${composition.speculative}%`);\n\nif (rule40 > 40) insights.push(`✅ 40%法則通過 (${rule40}%)`);\nelse if (rule40 > 0) insights.push(`⚠️ 40%法則未通過 (${rule40}%)`);\n\nif (rsi < 20) insights.push(`🔥 RSI ${rsi} 超賣！留意反彈買點`);\nelse if (rsi < 30) insights.push(`📉 RSI ${rsi} 偏低，接近買入區`);\nelse if (rsi > 70) insights.push(`⚠️ RSI ${rsi} 超買，注意獲利了結`);\nelse if (rsi) insights.push(`📊 RSI ${rsi} 中性區間`);\n\nif (bollinger) {\n  if (price <= bollinger.lower) insights.push(`📊 股價觸及布林下軌 $${bollinger.lower}`);\n  if (price >= bollinger.upper) insights.push(`📊 股價觸及布林上軌 $${bollinger.upper}`);\n}\n\nif (buyScore === 3) insights.push(`🎯 三條件全部滿足！最安全買點！`);\nelse if (buyScore === 2) insights.push(`💡 ${buyScore}/3 買入條件觸發，接近買點`);\n\nif (sentiment.summary) insights.push(`📰 ${sentiment.summary}`);\n\nreturn [{\n  json: {\n    symbol,\n    price,\n    changePercent: technical.changePercent,\n    \n    // 十二宮格坐標\n    gridPosition: {\n      phase,\n      type: dominant,\n      label: `${phase === 'evaluate' ? '評估' : phase === 'buy' ? '買進' : phase === 'hold' ? '持有' : '賣出'}-${dominant === 'value' ? '價值' : dominant === 'growth' ? '成長' : '投機'}`,\n    },\n    \n    // 體質分析\n    composition,\n    rule40,\n    \n    // 技術指標\n    technical: {\n      rsi: technical.technical?.rsi,\n      bollinger: technical.technical?.bollinger,\n      ma50: technical.technical?.ma50,\n      ma60: technical.technical?.ma60,\n      macd: technical.technical?.macd,\n      volumeRatio: technical.technical?.volumeRatio,\n    },\n    \n    // 基本面\n    fundamentals: fundamentalData.fundamentals || {},\n    \n    // 籌碼面\n    topInstitutions: fundamentalData.topInstitutions || [],\n    \n    // 消息面\n    sentiment,\n    \n    // 買賣信號\n    buySignals: {\n      conditions: buyConditions,\n      score: buyScore,\n      alert: buyAlert,\n    },\n    sellSignals: {\n      conditions: sellConditions,\n      score: sellScore,\n    },\n    \n    // AI 建議\n    insights,\n    \n    timestamp: new Date().toISOString(),\n  }\n}];"
+      },
+      "id": "coordinate-engine",
+      "name": "🎯 十二宮格坐標引擎",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1200, 400]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ═══════════════════════════════════════\n// 輸出：儲存到 Google Sheet 或本地 JSON\n// ═══════════════════════════════════════\n\nconst data = $input.first().json;\n\n// 整理成扁平化格式方便存入 Sheet\nconst row = {\n  date: new Date().toISOString().split('T')[0],\n  symbol: data.symbol,\n  price: data.price,\n  change: data.changePercent,\n  \n  // 坐標\n  gridPhase: data.gridPosition?.phase,\n  gridType: data.gridPosition?.type,\n  gridLabel: data.gridPosition?.label,\n  \n  // 體質\n  valuePercent: data.composition?.value,\n  growthPercent: data.composition?.growth,\n  specPercent: data.composition?.speculative,\n  rule40: data.rule40,\n  \n  // 技術面\n  rsi: data.technical?.rsi,\n  bollingerUpper: data.technical?.bollinger?.upper,\n  bollingerMiddle: data.technical?.bollinger?.middle,\n  bollingerLower: data.technical?.bollinger?.lower,\n  ma50: data.technical?.ma50,\n  volumeRatio: data.technical?.volumeRatio,\n  \n  // 基本面\n  pe: data.fundamentals?.pe,\n  eps: data.fundamentals?.eps,\n  roe: data.fundamentals?.roe,\n  revenueGrowth: data.fundamentals?.revenueGrowth,\n  operatingMargin: data.fundamentals?.operatingMargins,\n  targetPrice: data.fundamentals?.targetMeanPrice,\n  \n  // 信號\n  buyScore: data.buySignals?.score,\n  buyAlert: data.buySignals?.alert,\n  sellScore: data.sellSignals?.score,\n  \n  // 情緒\n  sentimentScore: data.sentiment?.score,\n  sentimentLabel: data.sentiment?.sentiment,\n  \n  // AI\n  insights: data.insights?.join(' | '),\n};\n\nreturn [{ json: row }];"
+      },
+      "id": "format-output",
+      "name": "📋 格式化輸出",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1440, 400]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ═══════════════════════════════════════\n// 買點警報檢查\n// 滿足 2/3 條件時觸發通知\n// ═══════════════════════════════════════\n\nconst data = $input.first().json;\n\nif (data.buyScore >= 2) {\n  return [{\n    json: {\n      alert: true,\n      symbol: data.symbol,\n      price: data.price,\n      buyScore: data.buyScore,\n      gridLabel: data.gridLabel,\n      message: `🔥 ${data.symbol} 買點警報！\\n價格: $${data.price} (${data.change > 0 ? '+' : ''}${data.change}%)\\n坐標: ${data.gridLabel}\\n買入條件: ${data.buyScore}/3 觸發\\nRSI: ${data.rsi || 'N/A'}\\n\\n${data.insights || ''}`,\n    }\n  }];\n}\n\nreturn [{ json: { alert: false, symbol: data.symbol } }];"
+      },
+      "id": "alert-check",
+      "name": "🚨 買點警報檢查",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1680, 400]
+    }
+  ],
+  "connections": {
+    "⏰ 每日排程 (週一至五 07:00)": {
+      "main": [
+        [{ "node": "📋 觀察清單", "type": "main", "index": 0 }]
+      ]
+    },
+    "📋 觀察清單": {
+      "main": [
+        [
+          { "node": "📈 抓取歷史價格 (Yahoo Finance)", "type": "main", "index": 0 },
+          { "node": "🏦 抓取基本面數據", "type": "main", "index": 0 },
+          { "node": "📰 抓取新聞 (Google News RSS)", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "📈 抓取歷史價格 (Yahoo Finance)": {
+      "main": [
+        [{ "node": "📉 技術指標計算 (RSI + 布林 + MA)", "type": "main", "index": 0 }]
+      ]
+    },
+    "🏦 抓取基本面數據": {
+      "main": [
+        [{ "node": "🏦 基本面解析 + 5:3:2 體質", "type": "main", "index": 0 }]
+      ]
+    },
+    "📰 抓取新聞 (Google News RSS)": {
+      "main": [
+        [{ "node": "📰 新聞標題提取", "type": "main", "index": 0 }]
+      ]
+    },
+    "📰 新聞標題提取": {
+      "main": [
+        [{ "node": "🧠 Claude 情緒分析", "type": "main", "index": 0 }]
+      ]
+    },
+    "📉 技術指標計算 (RSI + 布林 + MA)": {
+      "main": [
+        [{ "node": "🎯 十二宮格坐標引擎", "type": "main", "index": 0 }]
+      ]
+    },
+    "🏦 基本面解析 + 5:3:2 體質": {
+      "main": [
+        [{ "node": "🎯 十二宮格坐標引擎", "type": "main", "index": 0 }]
+      ]
+    },
+    "🧠 Claude 情緒分析": {
+      "main": [
+        [{ "node": "🎯 十二宮格坐標引擎", "type": "main", "index": 0 }]
+      ]
+    },
+    "🎯 十二宮格坐標引擎": {
+      "main": [
+        [
+          { "node": "📋 格式化輸出", "type": "main", "index": 0 },
+          { "node": "🚨 買點警報檢查", "type": "main", "index": 0 }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}
